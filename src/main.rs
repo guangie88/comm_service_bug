@@ -1,6 +1,3 @@
-#![feature(plugin)]
-#![plugin(rocket_codegen)]
-
 #[macro_use]
 extern crate derive_new;
 
@@ -11,23 +8,23 @@ extern crate error_chain;
 extern crate log;
 extern crate log4rs;
 extern crate reqwest;
-extern crate rocket;
-extern crate rocket_contrib;
+
+#[macro_use]
+extern crate rouille;
 
 #[macro_use]
 extern crate serde_derive;
+extern crate serde_json;
 extern crate structopt;
 
 #[macro_use]
 extern crate structopt_derive;
 
 use reqwest::Client;
-use rocket::config::{Config, Environment};
-use rocket::State;
-use rocket_contrib::JSON;
+use rouille::{Request, Response};
 use std::io::{self, Read, Write};
 use std::process::{self, Command, Output};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 use structopt::StructOpt;
@@ -60,11 +57,10 @@ fn run_cmd(cmd: &str) -> std::result::Result<Output, io::Error> {
     }
 }
 
-#[post("/execute")]
-fn execute(index: State<RwLock<u64>>, config: State<MainConfig>) -> Result<JSON<ExecOutput>> {
+fn execute(index: Arc<RwLock<u64>>, config: Arc<MainConfig>) -> Result<ExecOutput> {
     info!("Server received /execute");
 
-    let mut index = match index.write() {
+    let mut index = match (*index).write() {
         Ok(index) => index,
         Err(_) => bail!("Unable to write into index for increment"),
     };
@@ -72,13 +68,13 @@ fn execute(index: State<RwLock<u64>>, config: State<MainConfig>) -> Result<JSON<
     let cur_index = *index;
     *index = cur_index + 1;
 
-    run_cmd(&config.cmd)
+    run_cmd(&(*config).cmd)
         .map(|output| {
-            JSON(ExecOutput::new(
+            ExecOutput::new(
                 cur_index,
                 output.status.code().clone(),
                 String::from_utf8_lossy(&output.stdout).to_string(),
-                String::from_utf8_lossy(&output.stderr).to_string()))
+                String::from_utf8_lossy(&output.stderr).to_string())
         })
         .chain_err(|| "Unable to perform execute")
 }
@@ -97,6 +93,34 @@ struct MainConfig {
 
     #[structopt(short = "l", long = "log-config-path", help = "Log config file path")]
     log_config_path: String,
+}
+
+fn route(request: &Request, index: Arc<RwLock<u64>>, config: Arc<MainConfig>) -> Response {
+    router!(request,
+        (POST) (/execute) => {
+            let combine_err = |index, config| -> Result<String> {
+                let exec_output = execute(index, config)
+                    .chain_err(|| "Error in executing command")?;
+
+                serde_json::to_string(&exec_output)
+                    .chain_err(|| "Unable to deserialize executed output into JSON")
+            };
+
+            match combine_err(index, config) {
+                Ok(exec_content) => {
+                    Response::text(exec_content)
+                },
+
+                Err(e) => {
+                    Response::text(format!("{}", e))
+                        .with_status_code(400)
+                },
+            }
+        },
+
+        _ => Response::text("Attempting to get response from invalid endpoint / via invalid method")
+            .with_status_code(404)
+    )
 }
 
 fn run() -> Result<()> {
@@ -149,19 +173,15 @@ fn run() -> Result<()> {
 
     // server side
 
-    let rocket_config = Config::build(Environment::Production)
-        .address("0.0.0.0")
-        .port(config.port)
-        .finalize()
-        .chain_err(|| "Unable to create the custom rocket configuration!")?;
+    let index = Arc::new(RwLock::new(0u64));
+    let config = Arc::new(config);
 
-    // set up the server and do not reinitialize the logging system
-    rocket::custom(rocket_config, false)
-        .manage(RwLock::new(0u64))
-        .manage(config)
-        .mount("/", routes![execute]).launch();
+    rouille::start_server(&format!("0.0.0.0:{}", config.port), move |request| {
+        let index = index.clone();
+        let config = config.clone();
 
-    Ok(())
+        route(&request, index, config)
+    });
 }
 
 fn main() {
